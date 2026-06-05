@@ -33,7 +33,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
 
 
-INPUT_DIR = Path("/kaggle/input/ser-ravdess-features")
+INPUT_DIR = Path("/kaggle/input/datasets/nhatphatnguyen/ser-ravdess-features") 
 NPZ_PATH = INPUT_DIR / "ravdess_features.npz"
 NORM_STATS_PATH = INPUT_DIR / "norm_stats.npz"
 METADATA_CSV = INPUT_DIR / "metadata.csv"
@@ -642,22 +642,153 @@ torch.cuda.empty_cache()
 # # Cell 9 - Train Main Model P1 (CNN-BiLSTM-Attention)
 
 # %%
-train_loader_16, val_loader_16 = make_loaders(batch_size=16)
+def class_weights_from_loader(train_loader: DataLoader) -> torch.Tensor:
+    train_dataset = train_loader.dataset
+    train_labels = train_dataset.labels[train_dataset.indices]
+    class_counts = np.bincount(train_labels, minlength=N_CLASSES).astype(np.float32)
+    class_counts = np.maximum(class_counts, 1.0)
+    weights = class_counts.sum() / (N_CLASSES * class_counts)
+    return torch.tensor(weights, dtype=torch.float32, device=device)
+
+
+def train_p1_v2(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    epochs: int = 100,
+    lr: float = 1e-4,
+    patience: int = 15,
+    save_path: str | Path = MODEL_DIR / "p1_hybrid_v2_best.pt",
+) -> dict[str, list[float] | int]:
+    model = maybe_data_parallel(model)
+    criterion = nn.CrossEntropyLoss(weight=class_weights_from_loader(train_loader))
+    optimizer = Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=50,
+        eta_min=1e-6,
+    )
+
+    history: dict[str, list[float] | int] = {
+        "train_loss": [],
+        "val_loss": [],
+        "train_acc": [],
+        "val_acc": [],
+        "epochs_trained": 0,
+    }
+    best_val_loss = float("inf")
+    best_state = None
+    epochs_without_improvement = 0
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        train_loss_total = 0.0
+        train_correct = 0
+        train_total = 0
+
+        for mel_spec, mfcc, labels in train_loader:
+            mel_spec = mel_spec.to(device, non_blocking=True)
+            mfcc = mfcc.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(mel_spec, mfcc)
+            loss = criterion(logits, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            batch_size = labels.size(0)
+            train_loss_total += loss.item() * batch_size
+            train_correct += (logits.argmax(dim=1) == labels).sum().item()
+            train_total += batch_size
+
+        train_loss = train_loss_total / train_total
+        train_acc = train_correct / train_total
+
+        model.eval()
+        val_loss_total = 0.0
+        val_correct = 0
+        val_total = 0
+        with torch.no_grad():
+            for mel_spec, mfcc, labels in val_loader:
+                mel_spec = mel_spec.to(device, non_blocking=True)
+                mfcc = mfcc.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+
+                logits = model(mel_spec, mfcc)
+                loss = criterion(logits, labels)
+
+                batch_size = labels.size(0)
+                val_loss_total += loss.item() * batch_size
+                val_correct += (logits.argmax(dim=1) == labels).sum().item()
+                val_total += batch_size
+
+        val_loss = val_loss_total / val_total
+        val_acc = val_correct / val_total
+        scheduler.step()
+
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["train_acc"].append(train_acc)
+        history["val_acc"].append(val_acc)
+        history["epochs_trained"] = epoch
+
+        print(
+            f"Epoch {epoch:03d} | "
+            f"Train Loss {train_loss:.4f} | Val Loss {val_loss:.4f} | "
+            f"Train Acc {train_acc:.4f} | Val Acc {val_acc:.4f} | "
+            f"LR {scheduler.get_last_lr()[0]:.6f}"
+        )
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = copy.deepcopy(unwrap_model(model).state_dict())
+            torch.save(
+                {
+                    "model_state_dict": best_state,
+                    "epoch": epoch,
+                    "val_loss": best_val_loss,
+                    "history": history,
+                    "class_weights": criterion.weight.detach().cpu(),
+                },
+                save_path,
+            )
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        if epochs_without_improvement >= patience:
+            print(f"Early stopping at epoch {epoch}")
+            break
+
+    if best_state is not None:
+        unwrap_model(model).load_state_dict(best_state)
+
+    return history
+
+
+train_loader_p1, val_loader_p1 = make_loaders(batch_size=32)
 
 p1_model = HybridSERModel(n_classes=N_CLASSES)
 p1_params = count_parameters(p1_model)
-p1_history = train_model(
+p1_history = train_p1_v2(
     p1_model,
-    train_loader_16,
-    val_loader_16,
-    epochs=80,
-    lr=5e-4,
-    patience=10,
-    save_path=MODEL_DIR / "p1_hybrid_best.pt",
+    train_loader_p1,
+    val_loader_p1,
+    epochs=100,
+    lr=1e-4,
+    patience=15,
+    save_path=MODEL_DIR / "p1_hybrid_v2_best.pt",
 )
-plot_history(p1_history, "P1 Hybrid")
-p1_acc, p1_f1 = evaluate_model(p1_model, val_loader_16)
-print(f"P1 Hybrid | Val Accuracy: {p1_acc:.4f} | Val Macro-F1: {p1_f1:.4f}")
+plot_history(p1_history, "P1 Hybrid v2")
+p1_model = maybe_data_parallel(p1_model)
+checkpoint = torch.load(MODEL_DIR / "p1_hybrid_v2_best.pt", map_location=device)
+unwrap_model(p1_model).load_state_dict(checkpoint["model_state_dict"])
+p1_acc, p1_f1 = evaluate_model(p1_model, val_loader_p1)
+print(f"P1 Hybrid v2 | Val Accuracy: {p1_acc:.4f} | Val Macro-F1: {p1_f1:.4f}")
 torch.cuda.empty_cache()
 
 # %% [markdown]

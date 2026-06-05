@@ -18,6 +18,9 @@ N_MFCC = 40
 N_MELS = 128
 TARGET_FRAMES = 300
 EPS = 1e-8
+N_CHROMA = 12
+N_AUX_FEATURES = N_CHROMA + 2
+TRANSFORMER_FEATURES = (N_MFCC * 3) + N_AUX_FEATURES
 
 
 def load_audio(path: str | Path, sr: int = SR, top_db: int = 30) -> tuple[np.ndarray, int]:
@@ -64,6 +67,104 @@ def extract_mel(y: np.ndarray, sr: int = SR) -> np.ndarray:
     )
     log_mel = librosa.power_to_db(mel_power, ref=np.max)
     return log_mel.astype(np.float32, copy=False)
+
+
+def _match_frame_count(feature: np.ndarray, frames: int) -> np.ndarray:
+    """Pad or crop a feature matrix to match a target frame count."""
+    if feature.shape[1] == frames:
+        return feature
+    if feature.shape[1] > frames:
+        return feature[:, :frames]
+    return np.pad(feature, ((0, 0), (0, frames - feature.shape[1])), mode="constant")
+
+
+def mel_stack_from_mel(mel_spec: np.ndarray) -> np.ndarray:
+    """Build a 3-channel Mel stack: Mel, delta Mel, delta-delta Mel."""
+    mel_spec = _ensure_min_frames(mel_spec)
+    delta = librosa.feature.delta(mel_spec)
+    delta_delta = librosa.feature.delta(mel_spec, order=2)
+    return np.stack([mel_spec, delta, delta_delta]).astype(np.float32, copy=False)
+
+
+def extract_mel_stack(y: np.ndarray, sr: int = SR) -> np.ndarray:
+    """Extract log-Mel plus delta and delta-delta channels as (3, 128, T)."""
+    return mel_stack_from_mel(extract_mel(y, sr))
+
+
+def extract_transformer_features(y: np.ndarray, sr: int = SR) -> np.ndarray:
+    """Extract MFCC stack plus Chroma, ZCR, and RMSE as (134, T)."""
+    mfcc_stack = extract_mfcc(y, sr)
+    frames = mfcc_stack.shape[1]
+
+    chroma = librosa.feature.chroma_stft(
+        y=y,
+        sr=sr,
+        n_fft=N_FFT,
+        hop_length=HOP_LENGTH,
+        win_length=WIN_LENGTH,
+    )
+    zcr = librosa.feature.zero_crossing_rate(
+        y=y,
+        frame_length=WIN_LENGTH,
+        hop_length=HOP_LENGTH,
+    )
+    rmse = librosa.feature.rms(
+        y=y,
+        frame_length=WIN_LENGTH,
+        hop_length=HOP_LENGTH,
+    )
+
+    extras = np.vstack(
+        [
+            _match_frame_count(chroma, frames),
+            _match_frame_count(zcr, frames),
+            _match_frame_count(rmse, frames),
+        ]
+    )
+    return np.vstack([mfcc_stack, extras]).astype(np.float32, copy=False)
+
+
+def add_gaussian_noise_snr(
+    y: np.ndarray,
+    snr_db: float,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Add Gaussian noise at a target SNR in decibels."""
+    rng = rng or np.random.default_rng()
+    signal_power = np.mean(np.square(y)) + EPS
+    noise_power = signal_power / (10.0 ** (snr_db / 10.0))
+    noise = rng.normal(0.0, np.sqrt(noise_power), size=y.shape)
+    return (y + noise).astype(np.float32, copy=False)
+
+
+def augment_audio(
+    y: np.ndarray,
+    sr: int = SR,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Apply optional raw-audio augmentation before feature extraction."""
+    rng = rng or np.random.default_rng()
+    augmented = y.astype(np.float32, copy=True)
+
+    if rng.random() < 0.5:
+        augmented = add_gaussian_noise_snr(
+            augmented,
+            snr_db=float(rng.uniform(15.0, 30.0)),
+            rng=rng,
+        )
+    if rng.random() < 0.3:
+        augmented = librosa.effects.time_stretch(
+            augmented,
+            rate=float(rng.uniform(0.8, 1.2)),
+        ).astype(np.float32, copy=False)
+    if rng.random() < 0.3:
+        augmented = librosa.effects.pitch_shift(
+            augmented,
+            sr=sr,
+            n_steps=float(rng.uniform(-2.0, 2.0)),
+        ).astype(np.float32, copy=False)
+
+    return augmented
 
 
 def pad_or_truncate(feat: np.ndarray, T: int = TARGET_FRAMES) -> np.ndarray:

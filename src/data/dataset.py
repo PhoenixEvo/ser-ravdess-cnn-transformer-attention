@@ -1,0 +1,229 @@
+"""Dataset utilities for the CNN-Transformer SER model."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from sklearn.model_selection import train_test_split
+from torch.utils.data import Dataset
+
+
+N_CLASSES = 8
+TARGET_FRAMES = 300
+MEL_BINS = 128
+MFCC_STACK_CHANNELS = 120
+TRANSFORMER_FEATURES = 134
+EPS = 1e-8
+
+
+@dataclass(frozen=True)
+class FeatureStats:
+    mfcc_mean: np.ndarray
+    mfcc_std: np.ndarray
+    mel_mean: np.ndarray
+    mel_std: np.ndarray
+
+
+def split_indices(
+    actor_ids: np.ndarray,
+    labels: np.ndarray,
+    seed: int = 42,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Split data with actors 23-24 reserved as speaker-disjoint test."""
+    actor_ids = np.asarray(actor_ids)
+    labels = np.asarray(labels)
+
+    test_mask = np.isin(actor_ids, [23, 24])
+    test_idx = np.flatnonzero(test_mask)
+    train_val_idx = np.flatnonzero(~test_mask)
+
+    target_val_count = int(round(0.15 * len(labels)))
+    val_fraction = target_val_count / len(train_val_idx)
+    train_idx, val_idx = train_test_split(
+        train_val_idx,
+        test_size=val_fraction,
+        random_state=seed,
+        stratify=labels[train_val_idx],
+    )
+    return np.sort(train_idx), np.sort(val_idx), np.sort(test_idx)
+
+
+def _np_delta(feature: np.ndarray) -> np.ndarray:
+    return np.gradient(feature, axis=-1).astype(np.float32, copy=False)
+
+
+def _compute_stats(
+    mfcc_stack: np.ndarray,
+    mel_spec: np.ndarray,
+    train_indices: np.ndarray,
+) -> FeatureStats:
+    mfcc_train = mfcc_stack[train_indices]
+    mel_train = mel_spec[train_indices]
+    return FeatureStats(
+        mfcc_mean=mfcc_train.mean(axis=(0, 2))[:, None].astype(np.float32),
+        mfcc_std=(mfcc_train.std(axis=(0, 2))[:, None] + EPS).astype(np.float32),
+        mel_mean=mel_train.mean(axis=(0, 2))[:, None].astype(np.float32),
+        mel_std=(mel_train.std(axis=(0, 2))[:, None] + EPS).astype(np.float32),
+    )
+
+
+def _load_stats(
+    norm_stats_path: str | Path | None,
+    mfcc_stack: np.ndarray,
+    mel_spec: np.ndarray,
+    train_indices: np.ndarray,
+) -> FeatureStats:
+    if norm_stats_path is not None and Path(norm_stats_path).exists():
+        with np.load(norm_stats_path) as stats:
+            return FeatureStats(
+                mfcc_mean=stats["mfcc_mean"].astype(np.float32),
+                mfcc_std=stats["mfcc_std"].astype(np.float32),
+                mel_mean=stats["mel_mean"].astype(np.float32),
+                mel_std=stats["mel_std"].astype(np.float32),
+            )
+    return _compute_stats(mfcc_stack, mel_spec, train_indices)
+
+
+class RAVDESSCNNTransformerDataset(Dataset):
+    """NPZ-backed dataset for CNN-Transformer SER training.
+
+    Returns:
+        mel3: Tensor shaped (3, 128, 300)
+        seq: Tensor shaped (300, 134)
+        label: LongTensor scalar
+    """
+
+    _feature_cache: dict[str, dict[str, np.ndarray]] = {}
+
+    def __init__(
+        self,
+        npz_path: str | Path,
+        split: str,
+        norm_stats_path: str | Path | None = None,
+        augment: bool = False,
+        augment_repeats: int = 3,
+        seed: int = 42,
+    ) -> None:
+        if split not in {"train", "val", "test"}:
+            raise ValueError("split must be one of: train, val, test")
+
+        self.npz_path = str(npz_path)
+        self.split = split
+        self.augment = augment and split == "train"
+        self.augment_repeats = max(1, int(augment_repeats)) if self.augment else 1
+
+        features = self._load_features(self.npz_path)
+        self.mfcc_stack = features["mfcc_stack"]
+        self.mel_spec = features["mel_spec"]
+        self.labels = features["labels"]
+        self.actor_ids = features["actor_ids"]
+
+        train_idx, val_idx, test_idx = split_indices(self.actor_ids, self.labels, seed=seed)
+        split_map = {"train": train_idx, "val": val_idx, "test": test_idx}
+        self.base_indices = split_map[split]
+        self.stats = _load_stats(
+            norm_stats_path,
+            self.mfcc_stack,
+            self.mel_spec,
+            train_idx,
+        )
+
+    @classmethod
+    def _load_features(cls, npz_path: str) -> dict[str, np.ndarray]:
+        if npz_path not in cls._feature_cache:
+            with np.load(npz_path) as data:
+                cls._feature_cache[npz_path] = {key: data[key] for key in data.files}
+        return cls._feature_cache[npz_path]
+
+    @property
+    def base_labels(self) -> np.ndarray:
+        return self.labels[self.base_indices]
+
+    @property
+    def base_actor_ids(self) -> np.ndarray:
+        return self.actor_ids[self.base_indices]
+
+    def __len__(self) -> int:
+        return len(self.base_indices) * self.augment_repeats
+
+    def _base_item(self, item: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        base_idx = self.base_indices[item % len(self.base_indices)]
+
+        mel = (self.mel_spec[base_idx].astype(np.float32) - self.stats.mel_mean) / self.stats.mel_std
+        mel_delta = _np_delta(mel)
+        mel_delta2 = _np_delta(mel_delta)
+        mel3 = np.stack([mel, mel_delta, mel_delta2]).astype(np.float32, copy=False)
+
+        mfcc = (
+            self.mfcc_stack[base_idx].astype(np.float32) - self.stats.mfcc_mean
+        ) / self.stats.mfcc_std
+        aux = np.zeros((TRANSFORMER_FEATURES - MFCC_STACK_CHANNELS, TARGET_FRAMES), dtype=np.float32)
+        seq = np.vstack([mfcc, aux]).T.astype(np.float32, copy=False)
+
+        return (
+            torch.from_numpy(mel3).float(),
+            torch.from_numpy(seq).float(),
+            torch.tensor(int(self.labels[base_idx]), dtype=torch.long),
+        )
+
+    def _add_noise_snr(self, tensor: torch.Tensor) -> torch.Tensor:
+        snr_db = float(torch.empty(1).uniform_(15.0, 30.0).item())
+        signal_power = tensor.pow(2).mean().clamp_min(EPS)
+        noise_power = signal_power / (10.0 ** (snr_db / 10.0))
+        return tensor + torch.randn_like(tensor) * torch.sqrt(noise_power)
+
+    def _time_stretch(self, mel3: torch.Tensor, seq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        rate = float(torch.empty(1).uniform_(0.8, 1.2).item())
+        stretched_frames = max(16, int(round(TARGET_FRAMES / rate)))
+
+        mel = F.interpolate(
+            mel3.unsqueeze(0),
+            size=(MEL_BINS, stretched_frames),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+        seq_t = F.interpolate(
+            seq.T.unsqueeze(0),
+            size=stretched_frames,
+            mode="linear",
+            align_corners=False,
+        ).squeeze(0).T
+
+        if stretched_frames >= TARGET_FRAMES:
+            mel = mel[..., :TARGET_FRAMES]
+            seq_t = seq_t[:TARGET_FRAMES]
+        else:
+            mel = F.pad(mel, (0, TARGET_FRAMES - stretched_frames))
+            seq_t = F.pad(seq_t.T, (0, TARGET_FRAMES - stretched_frames)).T
+        return mel, seq_t
+
+    def _pitch_shift_approx(self, mel3: torch.Tensor, seq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        semitones = int(torch.randint(-2, 3, (1,)).item())
+        if semitones == 0:
+            return mel3, seq
+        mel_bins_shift = int(round(semitones * 2))
+        mfcc_shift = semitones
+        mel3 = torch.roll(mel3, shifts=mel_bins_shift, dims=1)
+        seq_mfcc = torch.roll(seq[:, :MFCC_STACK_CHANNELS], shifts=mfcc_shift, dims=1)
+        seq = torch.cat([seq_mfcc, seq[:, MFCC_STACK_CHANNELS:]], dim=1)
+        return mel3, seq
+
+    def _augment(self, mel3: torch.Tensor, seq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if torch.rand(1).item() < 0.5:
+            mel3 = self._add_noise_snr(mel3)
+            seq = self._add_noise_snr(seq)
+        if torch.rand(1).item() < 0.3:
+            mel3, seq = self._time_stretch(mel3, seq)
+        if torch.rand(1).item() < 0.3:
+            mel3, seq = self._pitch_shift_approx(mel3, seq)
+        return mel3, seq
+
+    def __getitem__(self, item: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mel3, seq, label = self._base_item(item)
+        if self.augment:
+            mel3, seq = self._augment(mel3, seq)
+        return mel3, seq, label
