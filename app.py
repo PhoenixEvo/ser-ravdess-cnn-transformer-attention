@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import time
 from pathlib import Path
 
 import gradio as gr
@@ -294,5 +296,61 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CSS) as demo:
     )
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Launch the SER Gradio demo.")
+    share_group = parser.add_mutually_exclusive_group()
+    share_group.add_argument(
+        "--share",
+        dest="share",
+        action="store_true",
+        help="Request a public gradio.live share link.",
+    )
+    share_group.add_argument(
+        "--no-share",
+        dest="share",
+        action="store_false",
+        help="Run local/LAN only without requesting a public share link.",
+    )
+    parser.set_defaults(share=True)
+    parser.add_argument("--server-name", default="127.0.0.1", help="Host interface to bind.")
+    parser.add_argument("--server-port", type=int, default=7860, help="Port to bind.")
+    parser.add_argument("--debug", action="store_true", default=True, help="Enable Gradio debug mode.")
+    return parser.parse_args()
+
+
+def launch() -> None:
+    args = parse_args()
+    _, local_url, share_url = demo.launch(
+        share=args.share,
+        debug=args.debug,
+        server_name=args.server_name,
+        server_port=args.server_port,
+        show_error=True,
+        prevent_thread_lock=True,
+    )
+
+    print(f"\nLocal URL: {local_url}")
+    if args.share:
+        if share_url:
+            print(f"Public share URL: {share_url}")
+        else:
+            print(
+                "\nGradio could not create a public share link. "
+                "The app is still running locally.\n"
+                "This usually means the machine cannot reach Gradio's tunnel service "
+                "or the service is temporarily unavailable.\n\n"
+                "Fix options:\n"
+                "1. Check VPN/firewall/proxy and retry: uv run --with-requirements requirements.txt python app.py --share\n"
+                "2. Use LAN access: uv run --with-requirements requirements.txt python app.py --no-share --server-name 0.0.0.0\n"
+                "3. Use another tunnel, e.g. install cloudflared then run: cloudflared tunnel --url http://127.0.0.1:7860\n"
+            )
+
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        print("Shutting down Gradio app.")
+
+
 if __name__ == "__main__":
-    demo.launch(share=True, debug=True)
+    launch()

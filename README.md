@@ -230,6 +230,24 @@ Or run it directly with `uv` without manually creating an environment:
 uv run --with-requirements requirements.txt python app.py
 ```
 
+By default the app requests a public Gradio share link. If Gradio prints `Could not create share link`, the local app is still running, but the machine could not reach Gradio's public tunnel service. Retry with:
+
+```bash
+uv run --with-requirements requirements.txt python app.py --share
+```
+
+For local/LAN use without a Gradio public URL:
+
+```bash
+uv run --with-requirements requirements.txt python app.py --no-share --server-name 0.0.0.0
+```
+
+If you still need a public URL and Gradio share is unavailable, install a tunnel tool such as Cloudflare Tunnel and run it against the local app:
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:7860
+```
+
 The UI opens a `gr.Blocks` app with an upload/microphone audio widget, waveform plot, Mel spectrogram plot, predicted emotion card, 8-class horizontal probability chart, top-3 predictions, and an expandable model details panel. The expected screenshot shows a two-column top area for audio input and signal plots, followed by a full-width prediction and probability section.
 
 ### Demo Model Card
