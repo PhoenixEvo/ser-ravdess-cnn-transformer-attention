@@ -9,9 +9,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
 from torch import nn
-from torch.optim import Adam
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
@@ -35,6 +36,43 @@ def maybe_data_parallel(model: nn.Module, device: torch.device) -> nn.Module:
     return model
 
 
+def _soft_cross_entropy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    class_weights: torch.Tensor,
+) -> torch.Tensor:
+    log_probs = F.log_softmax(logits, dim=1)
+    weighted_targets = targets * class_weights.unsqueeze(0)
+    return -(weighted_targets * log_probs).sum(dim=1).mean()
+
+
+def _smooth_targets(targets: torch.Tensor, label_smoothing: float) -> torch.Tensor:
+    if label_smoothing <= 0.0:
+        return targets
+    n_classes = targets.size(1)
+    return targets * (1.0 - label_smoothing) + (label_smoothing / n_classes)
+
+
+def _mixup_batch(
+    mel3: torch.Tensor,
+    seq: torch.Tensor,
+    labels: torch.Tensor,
+    n_classes: int,
+    alpha: float = 0.4,
+    probability: float = 0.5,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    targets = F.one_hot(labels, num_classes=n_classes).float()
+    if mel3.size(0) < 2 or torch.rand(1, device=mel3.device).item() >= probability:
+        return mel3, seq, targets
+
+    lam = float(np.random.beta(alpha, alpha))
+    permutation = torch.randperm(mel3.size(0), device=mel3.device)
+    mel3 = lam * mel3 + (1.0 - lam) * mel3[permutation]
+    seq = lam * seq + (1.0 - lam) * seq[permutation]
+    targets = lam * targets + (1.0 - lam) * targets[permutation]
+    return mel3, seq, targets
+
+
 def train_cnn_transformer(
     model: nn.Module,
     train_loader: DataLoader,
@@ -46,14 +84,21 @@ def train_cnn_transformer(
     lr: float = 1e-4,
     patience: int = 15,
     label_smoothing: float = 0.1,
+    weight_decay: float = 1e-3,
+    warmup_epochs: int = 10,
+    eta_min: float = 1e-6,
+    mixup_alpha: float = 0.4,
+    mixup_probability: float = 0.5,
 ) -> tuple[nn.Module, dict[str, list[float] | int]]:
     model = maybe_data_parallel(model, device)
+    class_weights = class_weights.to(device)
     criterion = nn.CrossEntropyLoss(
         weight=class_weights.to(device),
         label_smoothing=label_smoothing,
     )
-    optimizer = Adam(model.parameters(), lr=lr)
-    scheduler = CosineAnnealingLR(optimizer, T_max=60, eta_min=1e-6)
+    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    cosine_epochs = max(1, max_epochs - warmup_epochs)
+    scheduler = CosineAnnealingLR(optimizer, T_max=cosine_epochs, eta_min=eta_min)
 
     history: dict[str, list[float] | int] = {
         "train_loss": [],
@@ -69,6 +114,11 @@ def train_cnn_transformer(
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(1, max_epochs + 1):
+        if epoch <= warmup_epochs:
+            warmup_scale = epoch / max(1, warmup_epochs)
+            for group in optimizer.param_groups:
+                group["lr"] = lr * warmup_scale
+
         model.train()
         train_loss_total = 0.0
         train_correct = 0
@@ -79,9 +129,19 @@ def train_cnn_transformer(
             seq = seq.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
+            mel3, seq, soft_targets = _mixup_batch(
+                mel3,
+                seq,
+                labels,
+                n_classes=class_weights.numel(),
+                alpha=mixup_alpha,
+                probability=mixup_probability,
+            )
+            soft_targets = _smooth_targets(soft_targets, label_smoothing)
+
             optimizer.zero_grad(set_to_none=True)
             logits = model(mel3, seq)
-            loss = criterion(logits, labels)
+            loss = _soft_cross_entropy(logits, soft_targets, class_weights)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -113,7 +173,8 @@ def train_cnn_transformer(
 
         val_loss = val_loss_total / val_total
         val_acc = val_correct / val_total
-        scheduler.step()
+        if epoch > warmup_epochs:
+            scheduler.step()
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
@@ -138,6 +199,10 @@ def train_cnn_transformer(
                     "val_loss": best_val_loss,
                     "history": history,
                     "class_weights": class_weights.cpu(),
+                    "weight_decay": weight_decay,
+                    "warmup_epochs": warmup_epochs,
+                    "mixup_alpha": mixup_alpha,
+                    "mixup_probability": mixup_probability,
                 },
                 save_path,
             )

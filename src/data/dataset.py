@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 import numpy as np
 import torch
@@ -105,11 +106,13 @@ class RAVDESSCNNTransformerDataset(Dataset):
         split: str,
         norm_stats_path: str | Path | None = None,
         augment: bool = False,
-        augment_repeats: int = 3,
+        augment_repeats: int = 5,
         seed: int = 42,
+        indices: Iterable[int] | np.ndarray | None = None,
+        stats_indices: Iterable[int] | np.ndarray | None = None,
     ) -> None:
-        if split not in {"train", "val", "test"}:
-            raise ValueError("split must be one of: train, val, test")
+        if split not in {"train", "val", "test", "custom"}:
+            raise ValueError("split must be one of: train, val, test, custom")
 
         self.npz_path = str(npz_path)
         self.split = split
@@ -123,13 +126,22 @@ class RAVDESSCNNTransformerDataset(Dataset):
         self.actor_ids = features["actor_ids"]
 
         train_idx, val_idx, test_idx = split_indices(self.actor_ids, self.labels, seed=seed)
-        split_map = {"train": train_idx, "val": val_idx, "test": test_idx}
-        self.base_indices = split_map[split]
+        if indices is None:
+            split_map = {"train": train_idx, "val": val_idx, "test": test_idx}
+            self.base_indices = split_map[split]
+            stat_idx = train_idx
+        else:
+            self.base_indices = np.asarray(list(indices), dtype=np.int64)
+            stat_idx = (
+                np.asarray(list(stats_indices), dtype=np.int64)
+                if stats_indices is not None
+                else self.base_indices
+            )
         self.stats = _load_stats(
             norm_stats_path,
             self.mfcc_stack,
             self.mel_spec,
-            train_idx,
+            stat_idx,
         )
 
     @classmethod
@@ -212,6 +224,19 @@ class RAVDESSCNNTransformerDataset(Dataset):
         seq = torch.cat([seq_mfcc, seq[:, MFCC_STACK_CHANNELS:]], dim=1)
         return mel3, seq
 
+    def _spec_augment(self, mel3: torch.Tensor) -> torch.Tensor:
+        time_width = int(torch.randint(0, 31, (1,)).item())
+        if time_width > 0:
+            start = int(torch.randint(0, TARGET_FRAMES - time_width + 1, (1,)).item())
+            mel3[:, :, start : start + time_width] = 0.0
+
+        freq_width = int(torch.randint(0, 21, (1,)).item())
+        if freq_width > 0:
+            start = int(torch.randint(0, MEL_BINS - freq_width + 1, (1,)).item())
+            mel3[:, start : start + freq_width, :] = 0.0
+
+        return mel3
+
     def _augment(self, mel3: torch.Tensor, seq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if torch.rand(1).item() < 0.5:
             mel3 = self._add_noise_snr(mel3)
@@ -220,6 +245,7 @@ class RAVDESSCNNTransformerDataset(Dataset):
             mel3, seq = self._time_stretch(mel3, seq)
         if torch.rand(1).item() < 0.3:
             mel3, seq = self._pitch_shift_approx(mel3, seq)
+        mel3 = self._spec_augment(mel3)
         return mel3, seq
 
     def __getitem__(self, item: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

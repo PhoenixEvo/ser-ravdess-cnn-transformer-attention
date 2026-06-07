@@ -212,3 +212,37 @@ RAVDESS dataset: [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa
 2. Poorna et al. (2025). Hybrid CNN-BiLSTM + Attention for SER. *Biomedical Signal Processing and Control*.
 3. ETASR (2026). Real-time SER with CNN-BiLSTM-Attention. 98.10% on RAVTESS.
 4. Scientific Reports (2025). Stacked CNN for multi-feature SER. 93.30% on RAVDESS.
+
+---
+
+## Gradio Demo App
+
+Run the polished Speech Emotion Recognition demo locally:
+
+```bash
+pip install -r requirements.txt
+python app.py
+```
+
+Or run it directly with `uv` without manually creating an environment:
+
+```bash
+uv run --with-requirements requirements.txt python app.py
+```
+
+The UI opens a `gr.Blocks` app with an upload/microphone audio widget, waveform plot, Mel spectrogram plot, predicted emotion card, 8-class horizontal probability chart, top-3 predictions, and an expandable model details panel. The expected screenshot shows a two-column top area for audio input and signal plots, followed by a full-width prediction and probability section.
+
+### Demo Model Card
+
+| Field | Value |
+|---|---|
+| Architecture | Dual-stream CNN-Transformer |
+| Inputs | 3-channel Mel stream `(1, 3, 128, 300)` and MFCC stream `(1, 300, 134)` |
+| Dataset | RAVDESS speech subset, 24 actors, 8 emotions, 1440 samples |
+| Classes | neutral, calm, happy, sad, angry, fearful, disgust, surprised |
+| Validation | Accuracy 72.22%, Macro-F1 71.79% |
+| Speaker-disjoint test | Accuracy 48.33% |
+| Training | Mixup augmentation (alpha=0.4), AdamW, CosineAnnealingLR |
+| Checkpoint | `best_model.pth` if present, otherwise `outputs/p2_cnn_transformer_best.pt` |
+
+Limitations: the model is trained on acted RAVDESS speech and may not generalize to spontaneous speech, unseen microphones, background noise, non-English speech, or long conversational audio without additional fine-tuning.
