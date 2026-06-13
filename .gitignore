@@ -1,6 +1,6 @@
 SER_*.md
 .agents/
-*.png
+.png
 *.wav
 *.npz
 *.pt

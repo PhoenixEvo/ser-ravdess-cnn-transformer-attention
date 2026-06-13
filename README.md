@@ -79,6 +79,8 @@ ser-ravdess-cnn-bilstm-attention/
 
 ## Model Architecture
 
+![Methodology Diagram](docs/methodology.png)
+
 ```
 Raw Audio (.wav, 16 kHz)
         │
