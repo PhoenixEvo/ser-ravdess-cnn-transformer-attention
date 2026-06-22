@@ -23,13 +23,72 @@ N_AUX_FEATURES = N_CHROMA + 2
 TRANSFORMER_FEATURES = (N_MFCC * 3) + N_AUX_FEATURES
 
 
-def load_audio(path: str | Path, sr: int = SR, top_db: int = 30) -> tuple[np.ndarray, int]:
-    """Load audio as mono 16 kHz and trim leading/trailing silence."""
+def load_audio(
+    path: str | Path,
+    sr: int = SR,
+    top_db: int = 30,
+    trim_silence: bool = True,
+) -> tuple[np.ndarray, int]:
+    """Load audio as mono 16 kHz with optional silence trimming."""
     y, loaded_sr = librosa.load(path, sr=sr, mono=True)
-    trimmed, _ = librosa.effects.trim(y, top_db=top_db)
-    if trimmed.size == 0:
-        trimmed = y
-    return trimmed.astype(np.float32, copy=False), loaded_sr
+    if trim_silence:
+        trimmed, _ = librosa.effects.trim(y, top_db=top_db)
+        if trimmed.size > 0:
+            y = trimmed
+    return y.astype(np.float32, copy=False), loaded_sr
+
+
+def sliding_window_starts(
+    num_samples: int,
+    sr: int = SR,
+    window_duration: float = 3.0,
+    hop_duration: float = 1.0,
+    min_window_duration: float = 1.5,
+) -> list[int]:
+    """Return window start samples, including a valid padded tail window."""
+    window_samples = int(round(window_duration * sr))
+    hop_samples = int(round(hop_duration * sr))
+    min_samples = int(round(min_window_duration * sr))
+
+    if window_samples <= 0 or hop_samples <= 0:
+        raise ValueError("window_duration and hop_duration must be positive")
+    if num_samples <= window_samples:
+        return [0]
+
+    starts = list(range(0, num_samples - window_samples + 1, hop_samples))
+    if not starts:
+        return [0]
+
+    last_full_end = starts[-1] + window_samples
+    if last_full_end < num_samples:
+        tail_start = starts[-1] + hop_samples
+        if num_samples - tail_start >= min_samples:
+            starts.append(tail_start)
+    return starts
+
+
+def sliding_audio_windows(
+    y: np.ndarray,
+    sr: int = SR,
+    window_duration: float = 3.0,
+    hop_duration: float = 1.0,
+    min_window_duration: float = 1.5,
+) -> list[np.ndarray]:
+    """Split arbitrary-length audio into fixed-size overlapping windows."""
+    window_samples = int(round(window_duration * sr))
+    windows: list[np.ndarray] = []
+    for start in sliding_window_starts(
+        len(y),
+        sr=sr,
+        window_duration=window_duration,
+        hop_duration=hop_duration,
+        min_window_duration=min_window_duration,
+    ):
+        window = y[start : start + window_samples]
+        if len(window) < window_samples:
+            window = np.pad(window, (0, window_samples - len(window)), mode="constant")
+        windows.append(window.astype(np.float32, copy=False))
+    return windows
 
 
 def _ensure_min_frames(feature: np.ndarray, min_frames: int = 9) -> np.ndarray:

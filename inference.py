@@ -19,6 +19,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from src.models.cnn_transformer_model import CNNTransformerSER  # noqa: E402
+from src.features.extract import sliding_audio_windows, sliding_window_starts  # noqa: E402
 
 
 EMOTIONS = [
@@ -65,16 +66,25 @@ def resolve_checkpoint(checkpoint_path: str | Path | None = None) -> Path:
     )
 
 
-def preprocess_audio(path: str | Path, sr: int = SR, duration: float = DURATION) -> tuple[np.ndarray, int]:
-    """Load mono audio, resample, trim silence, then pad/truncate to duration."""
+def preprocess_audio(
+    path: str | Path,
+    sr: int = SR,
+    duration: float | None = None,
+    trim_silence: bool = False,
+) -> tuple[np.ndarray, int]:
+    """Load full mono audio; optionally preserve the legacy fixed-duration mode."""
     y, loaded_sr = librosa.load(path, sr=sr, mono=True)
-    y, _ = librosa.effects.trim(y, top_db=30)
+    if trim_silence:
+        trimmed, _ = librosa.effects.trim(y, top_db=30)
+        if trimmed.size > 0:
+            y = trimmed
 
-    target_len = int(sr * duration)
-    if y.size >= target_len:
-        y = y[:target_len]
-    else:
-        y = np.pad(y, (0, target_len - y.size), mode="constant")
+    if duration is not None:
+        target_len = int(sr * duration)
+        if y.size >= target_len:
+            y = y[:target_len]
+        else:
+            y = np.pad(y, (0, target_len - y.size), mode="constant")
 
     return y.astype(np.float32, copy=False), loaded_sr
 
@@ -241,12 +251,81 @@ def load_model(checkpoint_path: str | Path | None = None, device: torch.device |
     return model
 
 
-def predict(
+def _smooth_window_probabilities(
+    probabilities: np.ndarray,
+    radius: int = 1,
+) -> np.ndarray:
+    """Apply centered moving-average smoothing across adjacent windows."""
+    if len(probabilities) <= 1 or radius <= 0:
+        return probabilities.copy()
+    smoothed = np.empty_like(probabilities)
+    for index in range(len(probabilities)):
+        start = max(0, index - radius)
+        end = min(len(probabilities), index + radius + 1)
+        smoothed[index] = probabilities[start:end].mean(axis=0)
+    return smoothed
+
+
+def _merge_emotion_segments(
+    windows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge adjacent windows with the same smoothed emotion label."""
+    if not windows:
+        return []
+
+    segments: list[dict[str, Any]] = []
+    current = {
+        "start": windows[0]["start"],
+        "end": windows[0]["end"],
+        "emotion": windows[0]["emotion"],
+        "confidences": [windows[0]["confidence"]],
+        "uncertain": windows[0]["uncertain"],
+    }
+    for window in windows[1:]:
+        if window["emotion"] == current["emotion"]:
+            current["end"] = window["end"]
+            current["confidences"].append(window["confidence"])
+            current["uncertain"] = current["uncertain"] or window["uncertain"]
+            continue
+        segments.append(
+            {
+                "start": current["start"],
+                "end": current["end"],
+                "emotion": current["emotion"],
+                "confidence": float(np.mean(current["confidences"])),
+                "uncertain": current["uncertain"],
+            }
+        )
+        current = {
+            "start": window["start"],
+            "end": window["end"],
+            "emotion": window["emotion"],
+            "confidences": [window["confidence"]],
+            "uncertain": window["uncertain"],
+        }
+    segments.append(
+        {
+            "start": current["start"],
+            "end": current["end"],
+            "emotion": current["emotion"],
+            "confidence": float(np.mean(current["confidences"])),
+            "uncertain": current["uncertain"],
+        }
+    )
+    return segments
+
+
+def predict_detailed(
     audio_path: str | Path,
     model: torch.nn.Module | None = None,
     device: torch.device | str | None = None,
-) -> dict[str, float]:
-    """Run full preprocessing, feature extraction, normalization, and inference."""
+    window_duration: float = DURATION,
+    hop_duration: float = 1.0,
+    min_window_duration: float = 1.5,
+    smoothing_radius: int = 1,
+    uncertainty_margin: float = 0.15,
+) -> dict[str, Any]:
+    """Return overall and time-resolved emotion predictions."""
     if audio_path is None:
         raise ValueError("Please upload or record an audio file first.")
 
@@ -254,22 +333,93 @@ def predict(
     if model is None:
         model = load_model(device=device)
 
-    y, sr = preprocess_audio(audio_path, sr=SR, duration=DURATION)
+    y, sr = preprocess_audio(audio_path, sr=SR, duration=None)
+    windows = sliding_audio_windows(
+        y,
+        sr=sr,
+        window_duration=window_duration,
+        hop_duration=hop_duration,
+        min_window_duration=min_window_duration,
+    )
+    starts = sliding_window_starts(
+        len(y),
+        sr=sr,
+        window_duration=window_duration,
+        hop_duration=hop_duration,
+        min_window_duration=min_window_duration,
+    )
     stats = load_normalization_stats()
-    mel = _build_mel_stream(y, sr, stats)
-    mfcc = _build_mfcc_stream(y, sr, stats)
+    mel_batch = np.stack([_build_mel_stream(window, sr, stats) for window in windows])
+    mfcc_batch = np.stack([_build_mfcc_stream(window, sr, stats) for window in windows])
 
-    mel_tensor = torch.from_numpy(mel).unsqueeze(0).float().to(device)
-    mfcc_tensor = torch.from_numpy(mfcc).unsqueeze(0).float().to(device)
+    mel_tensor = torch.from_numpy(mel_batch).float().to(device)
+    mfcc_tensor = torch.from_numpy(mfcc_batch).float().to(device)
 
-    if tuple(mel_tensor.shape) != (1, 3, 128, 300):
+    if tuple(mel_tensor.shape[1:]) != (3, 128, 300):
         raise ValueError(f"mel_stream shape mismatch: {tuple(mel_tensor.shape)}")
-    if tuple(mfcc_tensor.shape) != (1, 300, 134):
+    if tuple(mfcc_tensor.shape[1:]) != (300, 134):
         raise ValueError(f"mfcc_stream shape mismatch: {tuple(mfcc_tensor.shape)}")
 
     model.eval()
     with torch.no_grad():
         logits = model(mel_tensor, mfcc_tensor)
-        probabilities = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
+        window_probabilities = torch.softmax(logits, dim=1)
+        raw_probabilities = window_probabilities.cpu().numpy()
 
-    return {emotion: float(probabilities[index]) for index, emotion in enumerate(EMOTIONS)}
+    smoothed_probabilities = _smooth_window_probabilities(
+        raw_probabilities,
+        radius=smoothing_radius,
+    )
+    aggregate = smoothed_probabilities.mean(axis=0)
+    audio_duration = len(y) / sr
+    window_results: list[dict[str, Any]] = []
+    for index, (start_sample, probabilities) in enumerate(zip(starts, smoothed_probabilities)):
+        order = np.argsort(probabilities)[::-1]
+        top_index = int(order[0])
+        margin = float(probabilities[order[0]] - probabilities[order[1]])
+        window_results.append(
+            {
+                "index": index,
+                "start": start_sample / sr,
+                "end": min((start_sample / sr) + window_duration, audio_duration),
+                "emotion": EMOTIONS[top_index],
+                "confidence": float(probabilities[top_index]),
+                "uncertain": margin < uncertainty_margin,
+                "margin": margin,
+                "probabilities": {
+                    emotion: float(probabilities[class_index])
+                    for class_index, emotion in enumerate(EMOTIONS)
+                },
+            }
+        )
+
+    return {
+        "probabilities": {
+            emotion: float(aggregate[index])
+            for index, emotion in enumerate(EMOTIONS)
+        },
+        "windows": window_results,
+        "segments": _merge_emotion_segments(window_results),
+        "duration": audio_duration,
+        "window_count": len(window_results),
+    }
+
+
+def predict(
+    audio_path: str | Path,
+    model: torch.nn.Module | None = None,
+    device: torch.device | str | None = None,
+    window_duration: float = DURATION,
+    hop_duration: float = 1.0,
+    min_window_duration: float = 1.5,
+) -> dict[str, float]:
+    """Backward-compatible aggregate prediction."""
+    result = predict_detailed(
+        audio_path,
+        model=model,
+        device=device,
+        window_duration=window_duration,
+        hop_duration=hop_duration,
+        min_window_duration=min_window_duration,
+    )
+    return result["probabilities"]

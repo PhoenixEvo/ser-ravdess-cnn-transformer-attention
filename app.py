@@ -11,9 +11,10 @@ import librosa
 import librosa.display
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 
-from inference import EMOTIONS, extract_mel, load_model, predict, preprocess_audio
+from inference import EMOTIONS, load_model, predict_detailed, preprocess_audio
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -80,10 +81,19 @@ def plot_mel_spectrogram(audio_path: str | Path | None) -> plt.Figure:
     if audio_path is None:
         return _empty_figure("Upload or record audio to view Mel spectrogram")
     y, sr = preprocess_audio(audio_path)
-    mel_stack = extract_mel(y, sr)
+    mel_power = librosa.feature.melspectrogram(
+        y=y,
+        sr=sr,
+        n_fft=512,
+        hop_length=160,
+        win_length=400,
+        n_mels=128,
+        power=2.0,
+    )
+    log_mel = librosa.power_to_db(mel_power, ref=np.max)
     fig, ax = plt.subplots(figsize=(7, 3))
     img = librosa.display.specshow(
-        mel_stack[0],
+        log_mel,
         sr=sr,
         hop_length=160,
         x_axis="time",
@@ -94,6 +104,52 @@ def plot_mel_spectrogram(audio_path: str | Path | None) -> plt.Figure:
     )
     ax.set_title("Log-Mel Spectrogram")
     fig.colorbar(img, ax=ax, format="%+2.0f dB")
+    plt.tight_layout()
+    return fig
+
+
+def plot_emotion_timeline(result: dict | None) -> plt.Figure:
+    if not result or not result.get("windows"):
+        return _empty_figure("Emotion timeline will appear after analysis")
+
+    windows = result["windows"]
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    emotion_positions = {emotion: index for index, emotion in enumerate(EMOTIONS)}
+
+    for window in windows:
+        center = (window["start"] + window["end"]) / 2.0
+        color = "#9E9E9E" if window["uncertain"] else COLORS[window["emotion"]]
+        marker = "X" if window["uncertain"] else "o"
+        ax.scatter(
+            center,
+            emotion_positions[window["emotion"]],
+            s=80 + (window["confidence"] * 150),
+            color=color,
+            marker=marker,
+            edgecolor="#222222",
+            linewidth=0.6,
+            zorder=3,
+        )
+        ax.hlines(
+            emotion_positions[window["emotion"]],
+            window["start"],
+            window["end"],
+            color=color,
+            linewidth=5,
+            alpha=0.45,
+        )
+
+    ax.set_yticks(
+        np.arange(len(EMOTIONS)),
+        labels=[f"{EMOJI[emotion]} {emotion.title()}" for emotion in EMOTIONS],
+    )
+    ax.set_xlim(0, max(result["duration"], 0.1))
+    ax.set_xlabel("Time (seconds)")
+    ax.set_title(
+        f"Smoothed Emotion Timeline · {result['window_count']} windows "
+        "(gray X = mixed / uncertain)"
+    )
+    ax.grid(axis="x", alpha=0.2)
     plt.tight_layout()
     return fig
 
@@ -152,6 +208,41 @@ def format_top3(probabilities: dict[str, float]) -> str:
     return "<div class='top3-box'>" + "".join(lines) + "</div>"
 
 
+def format_segments(result: dict | None) -> str:
+    if not result or not result.get("segments"):
+        return "<div class='top3-box'>No temporal segments available.</div>"
+
+    rows = []
+    for segment in result["segments"]:
+        status = " · mixed/uncertain" if segment["uncertain"] else ""
+        rows.append(
+            "<div class='segment-row'>"
+            f"<span class='segment-time'>{segment['start']:.1f}s–{segment['end']:.1f}s</span>"
+            f"<b>{EMOJI[segment['emotion']]} {segment['emotion'].title()}</b>"
+            f"<span>{segment['confidence'] * 100:.1f}%{status}</span>"
+            "</div>"
+        )
+    return "<div class='top3-box'>" + "".join(rows) + "</div>"
+
+
+def window_table(result: dict | None) -> pd.DataFrame:
+    if not result:
+        return pd.DataFrame(columns=["Window", "Start", "End", "Emotion", "Confidence", "Status"])
+    return pd.DataFrame(
+        [
+            {
+                "Window": window["index"] + 1,
+                "Start": f"{window['start']:.1f}s",
+                "End": f"{window['end']:.1f}s",
+                "Emotion": f"{EMOJI[window['emotion']]} {window['emotion'].title()}",
+                "Confidence": f"{window['confidence'] * 100:.1f}%",
+                "Status": "Mixed / uncertain" if window["uncertain"] else "Stable",
+            }
+            for window in result["windows"]
+        ]
+    )
+
+
 def analyze(audio_path: str | None):
     waveform = plot_waveform(audio_path)
     mel_plot = plot_mel_spectrogram(audio_path)
@@ -165,10 +256,14 @@ def analyze(audio_path: str | None):
             f"<div class='prediction-card error'>Model unavailable: {error}</div>",
             plot_probabilities(empty_probs),
             "<div class='top3-box'>Prediction unavailable.</div>",
+            _empty_figure("Emotion timeline unavailable"),
+            "<div class='top3-box'>Temporal segments unavailable.</div>",
+            window_table(None),
         )
 
     try:
-        probabilities = predict(audio_path, model=MODEL, device=DEVICE)
+        result = predict_detailed(audio_path, model=MODEL, device=DEVICE)
+        probabilities = result["probabilities"]
     except Exception as exc:
         empty_probs = {emotion: 0.0 for emotion in EMOTIONS}
         return (
@@ -177,6 +272,9 @@ def analyze(audio_path: str | None):
             f"<div class='prediction-card error'>Inference error: {exc}</div>",
             plot_probabilities(empty_probs),
             "<div class='top3-box'>Prediction unavailable.</div>",
+            _empty_figure("Emotion timeline unavailable"),
+            "<div class='top3-box'>Temporal segments unavailable.</div>",
+            window_table(None),
         )
 
     return (
@@ -185,6 +283,9 @@ def analyze(audio_path: str | None):
         format_prediction(probabilities),
         plot_probabilities(probabilities),
         format_top3(probabilities),
+        plot_emotion_timeline(result),
+        format_segments(result),
+        window_table(result),
     )
 
 
@@ -247,6 +348,21 @@ CSS = """
 .top-row:last-child {
     border-bottom: 0;
 }
+.segment-row {
+    display: grid;
+    grid-template-columns: minmax(100px, 0.8fr) minmax(150px, 1fr) minmax(150px, 1.2fr);
+    gap: 12px;
+    align-items: center;
+    padding: 9px 0;
+    border-bottom: 1px solid #f0f0f0;
+}
+.segment-row:last-child {
+    border-bottom: 0;
+}
+.segment-time {
+    color: #555;
+    font-variant-numeric: tabular-nums;
+}
 """
 
 
@@ -278,6 +394,23 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CSS) as demo:
     probability_plot = gr.Plot(label="Emotion probability chart")
     top3_html = gr.HTML("<div class='top3-box'>Top 3 predictions will appear here.</div>")
 
+    gr.Markdown("## Emotion Over Time")
+    timeline_plot = gr.Plot(label="Smoothed emotion timeline")
+    with gr.Row():
+        with gr.Column(scale=1):
+            gr.Markdown("### Merged Segments")
+            segments_html = gr.HTML(
+                "<div class='top3-box'>Temporal segments will appear here.</div>"
+            )
+        with gr.Column(scale=2):
+            gr.Markdown("### Window Predictions")
+            windows_dataframe = gr.Dataframe(
+                headers=["Window", "Start", "End", "Emotion", "Confidence", "Status"],
+                datatype=["number", "str", "str", "str", "str", "str"],
+                interactive=False,
+                wrap=True,
+            )
+
     with gr.Accordion("Model Details", open=False):
         gr.Markdown(
             """
@@ -292,7 +425,16 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CSS) as demo:
     analyze_button.click(
         fn=analyze,
         inputs=audio_input,
-        outputs=[waveform_plot, mel_plot, prediction_html, probability_plot, top3_html],
+        outputs=[
+            waveform_plot,
+            mel_plot,
+            prediction_html,
+            probability_plot,
+            top3_html,
+            timeline_plot,
+            segments_html,
+            windows_dataframe,
+        ],
     )
 
 

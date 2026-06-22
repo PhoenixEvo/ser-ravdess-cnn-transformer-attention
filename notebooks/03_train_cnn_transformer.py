@@ -19,7 +19,10 @@ INPUT_DIR = Path("/kaggle/input/datasets/nhatphatnguyen/ser-ravdess-features")
 SRC_DIR = INPUT_DIR / "src"
 sys.path.append(str(SRC_DIR))
 
-from data.dataset import RAVDESSCNNTransformerDataset  # noqa: E402
+from data.dataset import (  # noqa: E402
+    RAVDESSCNNTransformerDataset,
+    SlidingWindowRAVDESSDataset,
+)
 from models.cnn_transformer_model import CNNTransformerSER, count_parameters  # noqa: E402
 from training.train import (  # noqa: E402
     class_weights_from_labels,
@@ -44,6 +47,22 @@ EMOTION_NAMES = [
 ]
 NPZ_PATH = INPUT_DIR / "ravdess_features.npz"
 NORM_STATS_PATH = INPUT_DIR / "norm_stats.npz"
+METADATA_CSV = INPUT_DIR / "metadata.csv"
+RAW_AUDIO_CANDIDATES = [
+    INPUT_DIR / "data/raw/ravdess",
+    INPUT_DIR / "ravdess",
+    INPUT_DIR / "Audio_Speech_Actors_01-24",
+    INPUT_DIR,
+]
+RAW_AUDIO_DIR = next(
+    (
+        path
+        for path in RAW_AUDIO_CANDIDATES
+        if path.exists() and any(path.glob("Actor_*/*.wav"))
+    ),
+    None,
+)
+USE_SLIDING_WINDOWS = METADATA_CSV.exists() and RAW_AUDIO_DIR is not None
 MODEL_DIR = Path("/kaggle/working/models")
 SAVE_PATH = MODEL_DIR / "p2_cnn_transformer_best.pt"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -61,29 +80,71 @@ seed_everything()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
 print(f"CUDA GPUs: {torch.cuda.device_count()}")
+print(f"Sliding-window raw audio: {USE_SLIDING_WINDOWS}")
 
-train_ds = RAVDESSCNNTransformerDataset(
-    NPZ_PATH,
-    split="train",
-    norm_stats_path=NORM_STATS_PATH,
-    augment=True,
-    augment_repeats=5,
-    seed=SEED,
-)
-val_ds = RAVDESSCNNTransformerDataset(
-    NPZ_PATH,
-    split="val",
-    norm_stats_path=NORM_STATS_PATH,
-    augment=False,
-    seed=SEED,
-)
-test_ds = RAVDESSCNNTransformerDataset(
-    NPZ_PATH,
-    split="test",
-    norm_stats_path=NORM_STATS_PATH,
-    augment=False,
-    seed=SEED,
-)
+if USE_SLIDING_WINDOWS:
+    train_ds = SlidingWindowRAVDESSDataset(
+        METADATA_CSV,
+        split="train",
+        norm_stats_path=NORM_STATS_PATH,
+        audio_root=RAW_AUDIO_DIR,
+        window_duration=3.0,
+        hop_duration=1.0,
+        min_window_duration=1.5,
+        augment=True,
+        augment_repeats=5,
+        seed=SEED,
+    )
+    val_ds = SlidingWindowRAVDESSDataset(
+        METADATA_CSV,
+        split="val",
+        norm_stats_path=NORM_STATS_PATH,
+        audio_root=RAW_AUDIO_DIR,
+        window_duration=3.0,
+        hop_duration=1.0,
+        min_window_duration=1.5,
+        augment=False,
+        seed=SEED,
+    )
+    test_ds = SlidingWindowRAVDESSDataset(
+        METADATA_CSV,
+        split="test",
+        norm_stats_path=NORM_STATS_PATH,
+        audio_root=RAW_AUDIO_DIR,
+        window_duration=3.0,
+        hop_duration=1.0,
+        min_window_duration=1.5,
+        augment=False,
+        seed=SEED,
+    )
+    print(
+        f"Window expansion: {len(train_ds.utterance_indices)} train utterances -> "
+        f"{len(train_ds.window_index)} base windows -> {len(train_ds)} augmented samples"
+    )
+else:
+    print("Raw WAVs not found; falling back to existing fixed-length NPZ features.")
+    train_ds = RAVDESSCNNTransformerDataset(
+        NPZ_PATH,
+        split="train",
+        norm_stats_path=NORM_STATS_PATH,
+        augment=True,
+        augment_repeats=5,
+        seed=SEED,
+    )
+    val_ds = RAVDESSCNNTransformerDataset(
+        NPZ_PATH,
+        split="val",
+        norm_stats_path=NORM_STATS_PATH,
+        augment=False,
+        seed=SEED,
+    )
+    test_ds = RAVDESSCNNTransformerDataset(
+        NPZ_PATH,
+        split="test",
+        norm_stats_path=NORM_STATS_PATH,
+        augment=False,
+        seed=SEED,
+    )
 
 print(f"Split sizes: train={len(train_ds)} ({len(train_ds.base_indices)} base), val={len(val_ds)}, test={len(test_ds)}")
 print("Train/val actor leakage check:", set(train_ds.base_actor_ids) & {23, 24}, set(val_ds.base_actor_ids) & {23, 24})
@@ -152,33 +213,64 @@ plt.tight_layout()
 plt.show()
 
 print("\nStarting stratified 5-fold CV without speaker-disjoint constraint")
-features = RAVDESSCNNTransformerDataset._load_features(str(NPZ_PATH))
-all_labels = features["labels"]
+if USE_SLIDING_WINDOWS:
+    metadata = pd.read_csv(METADATA_CSV)
+    all_labels = metadata["emotion_id"].to_numpy(dtype=np.int64) - 1
+else:
+    features = RAVDESSCNNTransformerDataset._load_features(str(NPZ_PATH))
+    all_labels = features["labels"]
 all_indices = np.arange(len(all_labels))
 skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
 cv_rows = []
 
 for fold, (fold_train_idx, fold_val_idx) in enumerate(skf.split(all_indices, all_labels), start=1):
     print(f"\nFold {fold}/5")
-    fold_train_ds = RAVDESSCNNTransformerDataset(
-        NPZ_PATH,
-        split="custom",
-        norm_stats_path=None,
-        augment=True,
-        augment_repeats=5,
-        seed=SEED,
-        indices=fold_train_idx,
-        stats_indices=fold_train_idx,
-    )
-    fold_val_ds = RAVDESSCNNTransformerDataset(
-        NPZ_PATH,
-        split="custom",
-        norm_stats_path=None,
-        augment=False,
-        seed=SEED,
-        indices=fold_val_idx,
-        stats_indices=fold_train_idx,
-    )
+    if USE_SLIDING_WINDOWS:
+        fold_train_ds = SlidingWindowRAVDESSDataset(
+            METADATA_CSV,
+            split="custom",
+            norm_stats_path=NORM_STATS_PATH,
+            audio_root=RAW_AUDIO_DIR,
+            window_duration=3.0,
+            hop_duration=1.0,
+            min_window_duration=1.5,
+            augment=True,
+            augment_repeats=5,
+            seed=SEED,
+            indices=fold_train_idx,
+        )
+        fold_val_ds = SlidingWindowRAVDESSDataset(
+            METADATA_CSV,
+            split="custom",
+            norm_stats_path=NORM_STATS_PATH,
+            audio_root=RAW_AUDIO_DIR,
+            window_duration=3.0,
+            hop_duration=1.0,
+            min_window_duration=1.5,
+            augment=False,
+            seed=SEED,
+            indices=fold_val_idx,
+        )
+    else:
+        fold_train_ds = RAVDESSCNNTransformerDataset(
+            NPZ_PATH,
+            split="custom",
+            norm_stats_path=None,
+            augment=True,
+            augment_repeats=5,
+            seed=SEED,
+            indices=fold_train_idx,
+            stats_indices=fold_train_idx,
+        )
+        fold_val_ds = RAVDESSCNNTransformerDataset(
+            NPZ_PATH,
+            split="custom",
+            norm_stats_path=None,
+            augment=False,
+            seed=SEED,
+            indices=fold_val_idx,
+            stats_indices=fold_train_idx,
+        )
 
     fold_train_loader = DataLoader(
         fold_train_ds,
